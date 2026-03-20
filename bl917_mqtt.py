@@ -44,6 +44,8 @@ POLL_INTERVAL = 60.0
 RECONNECT_DELAY = 15.0
 BLE_RESPONSE_TIMEOUT = 8.0
 BLE_CONNECT_TIMEOUT = 8.0
+BLE_CONNECT_RETRIES = 3
+BLE_SESSION_RETRIES = 3
 
 DEVICE_MANUFACTURER = "ZhiJinPower"
 DEVICE_MODEL = "BL-917"
@@ -165,6 +167,7 @@ class BL917Client:
         self.address = address
         self.client: Optional[BleakClient] = None
         self._connected = False
+        self._disconnect_expected = False
         self._rx_queue: asyncio.Queue[bytes] = asyncio.Queue()
 
     def is_connected(self) -> bool:
@@ -174,30 +177,48 @@ class BL917Client:
         if self.is_connected():
             return
 
-        await self.disconnect()
-
         def _handle_disconnect(_client):
-            _LOG.warning("BLE disconnected")
             self._connected = False
+            if self._disconnect_expected:
+                _LOG.debug("BLE disconnected")
+            else:
+                _LOG.warning("BLE disconnected")
 
-        self.client = BleakClient(
-            self.address,
-            timeout=BLE_CONNECT_TIMEOUT,
-            disconnected_callback=_handle_disconnect,
-        )
-
-        try:
-            await self.client.connect()
-            if not self.client.is_connected:
-                raise RuntimeError("BLE connect failed")
-            self._connected = True
-            await asyncio.sleep(0.5)
-            await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
-            await asyncio.sleep(1.0)
-            _LOG.info("BLE connected to %s", self.address)
-        except Exception:
+        last_error: Optional[Exception] = None
+        for attempt in range(1, BLE_CONNECT_RETRIES + 1):
             await self.disconnect()
-            raise
+            self._disconnect_expected = False
+            self.client = BleakClient(
+                self.address,
+                timeout=BLE_CONNECT_TIMEOUT,
+                disconnected_callback=_handle_disconnect,
+            )
+
+            try:
+                await self.client.connect()
+                if not self.client.is_connected:
+                    raise RuntimeError("BLE connect failed")
+                self._connected = True
+                await asyncio.sleep(0.5)
+                await self.client.start_notify(NOTIFY_UUID, self._notification_handler)
+                await asyncio.sleep(1.0)
+                _LOG.info("BLE connected to %s", self.address)
+                return
+            except Exception as exc:
+                last_error = exc
+                _LOG.warning(
+                    "BLE connect attempt %d/%d failed: %s",
+                    attempt,
+                    BLE_CONNECT_RETRIES,
+                    exc,
+                )
+                await self.disconnect()
+                if attempt < BLE_CONNECT_RETRIES:
+                    await asyncio.sleep(RECONNECT_DELAY)
+
+        raise RuntimeError(
+            f"BLE connect failed after {BLE_CONNECT_RETRIES} attempts"
+        ) from last_error
 
     async def disconnect(self) -> None:
         self._connected = False
@@ -206,6 +227,7 @@ class BL917Client:
         if self.client:
             try:
                 if self.client.is_connected:
+                    self._disconnect_expected = True
                     try:
                         await self.client.stop_notify(NOTIFY_UUID)
                     except Exception:
@@ -214,6 +236,7 @@ class BL917Client:
             except Exception:
                 _LOG.exception("Error during BLE disconnect")
             finally:
+                self._disconnect_expected = False
                 self.client = None
 
     def _clear_rx_queue(self) -> None:
@@ -376,6 +399,7 @@ class BL917MqttBridge:
 
         try:
             while not self.stop_event.is_set():
+                sleep_for = POLL_INTERVAL
                 try:
                     state = await self.poll_once()
                     self.publish_state(state)
@@ -385,8 +409,9 @@ class BL917MqttBridge:
                 except Exception:
                     _LOG.exception("BLE poll failed")
                     self.publish_availability("offline")
+                    sleep_for = RECONNECT_DELAY
 
-                await asyncio.sleep(POLL_INTERVAL)
+                await asyncio.sleep(sleep_for)
         finally:
             self.publish_availability("offline")
             await self.ble.disconnect()
@@ -395,25 +420,57 @@ class BL917MqttBridge:
 
     async def poll_once(self) -> dict:
         async with self.ble_op_lock:
-            try:
-                await self.ble.connect()
-                regs = await self.ble.read_all()
-                return self.decode_state(regs)
-            finally:
-                await self.ble.disconnect()
+            last_error: Optional[Exception] = None
+            for attempt in range(1, BLE_SESSION_RETRIES + 1):
+                try:
+                    await self.ble.connect()
+                    regs = await self.ble.read_all()
+                    return self.decode_state(regs)
+                except Exception as exc:
+                    last_error = exc
+                    _LOG.warning(
+                        "BLE poll session attempt %d/%d failed: %s",
+                        attempt,
+                        BLE_SESSION_RETRIES,
+                        exc,
+                    )
+                    if attempt < BLE_SESSION_RETRIES:
+                        await asyncio.sleep(2.0)
+                finally:
+                    await self.ble.disconnect()
+
+            raise RuntimeError(
+                f"BLE poll failed after {BLE_SESSION_RETRIES} session attempts"
+            ) from last_error
 
     async def command_session(self, coro):
         async with self.ble_op_lock:
-            try:
-                await self.ble.connect()
-                result = await coro()
-                regs = await self.ble.read_all()
-                state = self.decode_state(regs)
-                self.publish_state(state)
-                self.publish_availability("online")
-                return result
-            finally:
-                await self.ble.disconnect()
+            last_error: Optional[Exception] = None
+            for attempt in range(1, BLE_SESSION_RETRIES + 1):
+                try:
+                    await self.ble.connect()
+                    result = await coro()
+                    regs = await self.ble.read_all()
+                    state = self.decode_state(regs)
+                    self.publish_state(state)
+                    self.publish_availability("online")
+                    return result
+                except Exception as exc:
+                    last_error = exc
+                    _LOG.warning(
+                        "BLE command session attempt %d/%d failed: %s",
+                        attempt,
+                        BLE_SESSION_RETRIES,
+                        exc,
+                    )
+                    if attempt < BLE_SESSION_RETRIES:
+                        await asyncio.sleep(2.0)
+                finally:
+                    await self.ble.disconnect()
+
+            raise RuntimeError(
+                f"BLE command session failed after {BLE_SESSION_RETRIES} attempts"
+            ) from last_error
 
     def stop(self) -> None:
         self.stop_event.set()
