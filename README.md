@@ -148,3 +148,8 @@ If your controller reports different meanings, adjust `BATTERY_TYPE_MAP` in `bl9
 - The full register map is not completely verified.
 - Some units are inferred from testing.
 - The controller may disconnect BLE on its own, so polling reliability depends on the host BLE stack.
+
+## Hardware it works with (please complete the list)
+
+Solar Laderegler 12V 24V 30A MPPT High Definition LCD Digital Display Bildschirm Bluetooth Solar Controller Regler
+https://de.aliexpress.com/item/1005009244722899.html?spm=a2g0o.order_list.order_list_main.15.2a5a5c5ftlSMbk&gatewayAdapt=glo2deu
